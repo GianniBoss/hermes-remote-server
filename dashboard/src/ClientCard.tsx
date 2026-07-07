@@ -1,7 +1,8 @@
 import { ClientInfo } from './types';
 
-function Bar({ label, value, color }: { label: string; value: number; color: string }) {
-  const pct = Math.min(100, Math.max(0, value));
+function Bar({ label, value, color }: { label: string; value: number | undefined; color: string }) {
+  const v = typeof value === 'number' ? value : 0;
+  const pct = Math.min(100, Math.max(0, v));
   return (
     <div className="flex items-center gap-2 text-xs">
       <span className="w-8 text-gray-500">{label}</span>
@@ -16,7 +17,8 @@ function Bar({ label, value, color }: { label: string; value: number; color: str
   );
 }
 
-function formatUptime(hours: number): string {
+function formatUptime(hours: number | undefined): string {
+  if (!hours && hours !== 0) return '—';
   if (hours < 1) return `${Math.round(hours * 60)}m`;
   if (hours < 24) return `${hours.toFixed(0)}h`;
   const d = Math.floor(hours / 24);
@@ -24,7 +26,8 @@ function formatUptime(hours: number): string {
   return `${d}d ${h}h`;
 }
 
-function formatBytes(gb: number): string {
+function formatBytes(gb: number | undefined): string {
+  if (!gb && gb !== 0) return '—';
   if (gb >= 1000) return `${(gb / 1000).toFixed(1)}TB`;
   return `${gb.toFixed(0)}GB`;
 }
