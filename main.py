@@ -150,7 +150,7 @@ async def get_task_result(task_id: str):
     """Dashboard polls this to get command execution results."""
     result = _task_results.get(task_id)
     if not result:
-        raise HTTPException(status_code=404, detail="Task not found or not yet completed")
+        return {"status": "pending"}
     return result
 
 

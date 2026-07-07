@@ -59,35 +59,37 @@ export default function ChatPanel({ client, onClose }: Props) {
         attempts++;
         try {
           const r = await fetch(`/api/tasks/${taskId}`);
-          if (r.ok) {
-            const result = await r.json();
+          const result = await r.json();
+          if (result.status === 'pending') {
+            // Not done yet — keep polling
+            if (attempts >= maxAttempts) {
+              clearInterval(pollInterval);
+              setLoading(false);
+              setMessages(prev => [...prev, {
+                id: taskId + '-timeout',
+                type: 'error',
+                text: 'Command timed out (no response after 2 min)',
+                timestamp: new Date().toISOString(),
+              }]);
+            }
+          } else {
+            // Result received
             clearInterval(pollInterval);
             setLoading(false);
-
             const output = [
               result.stdout && `STDOUT:\n${result.stdout}`,
               result.stderr && `STDERR:\n${result.stderr}`,
               result.error && `ERROR: ${result.error}`,
             ].filter(Boolean).join('\n\n') || '(no output)';
-
             setMessages(prev => [...prev, {
               id: taskId + '-result',
               type: result.exit_code === 0 ? 'result' : 'error',
               text: output,
               timestamp: result.timestamp || new Date().toISOString(),
             }]);
-          } else if (attempts >= maxAttempts) {
-            clearInterval(pollInterval);
-            setLoading(false);
-            setMessages(prev => [...prev, {
-              id: taskId + '-timeout',
-              type: 'error',
-              text: 'Command timed out (no response after 2 min)',
-              timestamp: new Date().toISOString(),
-            }]);
           }
         } catch {
-          // Keep polling
+          // Network error — keep polling
         }
       }, 1000);
     } catch (e: any) {
