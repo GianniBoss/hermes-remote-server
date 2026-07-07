@@ -83,6 +83,7 @@ class HermesExecutor:
     def __init__(self, registry):
         self.registry = registry
         self._sessions: dict[str, HermesSession] = {}  # session_id → session
+        self._pending_sync_tasks: dict[str, asyncio.Future] = {}  # task_id → Future
 
     def create_session(self, pc_name: str) -> HermesSession:
         """Create a new isolated session for a client."""
@@ -96,7 +97,17 @@ class HermesExecutor:
         return self._sessions.get(session_id)
 
     def resolve_task_result(self, pc_name: str, task_id: str, result: dict):
-        """Route a task result to the correct session."""
+        """Route a task result to the correct session or sync task."""
+        # Check sync tasks first (for alma_exec tool)
+        if task_id in self._pending_sync_tasks:
+            future = self._pending_sync_tasks.pop(task_id)
+            if not future.done():
+                future.set_result(result)
+            # Turn off fast poll
+            self.registry.set_fast_poll(pc_name, False)
+            return
+
+        # Route to Hermes session
         for session in self._sessions.values():
             if session.pc_name == pc_name:
                 session.resolve_task(task_id, result)

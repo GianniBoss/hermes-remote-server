@@ -111,9 +111,11 @@ async def client_register(req: RegisterRequest, request: Request):
 async def client_heartbeat(req: HeartbeatRequest):
     """Client calls this periodically. Server responds with any pending tasks."""
     tasks = registry.heartbeat(req.pc_name, req.metrics)
+    interval = registry.get_poll_interval(req.pc_name)
     return {
         "status": "ok",
-        "tasks": tasks,  # [] or [{"task_id":"...", "command":"..."}, ...]
+        "poll_interval": interval,
+        "tasks": tasks,
     }
 
 
@@ -178,6 +180,57 @@ async def exec_command(pc_name: str, req: ExecRequest):
         "status": "queued",
         "message": f"Task queued for {pc_name}. Will execute on next heartbeat.",
     }
+
+
+class ExecSyncRequest(BaseModel):
+    command: str
+    timeout: int = 300
+
+
+@app.post("/api/clients/{pc_name}/exec-sync")
+async def exec_command_sync(pc_name: str, req: ExecSyncRequest):
+    """Execute a command on a client and WAIT for the result (blocking).
+
+    Used by Hermes's alma_exec tool for synchronous remote execution.
+    The server queues the task, waits for the client to pick it up and
+    return the result, then responds.
+    """
+    client = registry.get(pc_name)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if not client.online:
+        raise HTTPException(status_code=400, detail=f"Client '{pc_name}' is offline")
+
+    task_id = str(uuid.uuid4())[:8]
+    registry.enqueue_task(pc_name, task_id, req.command)
+
+    # Switch client to fast-poll mode so it picks up the task quickly
+    registry.set_fast_poll(pc_name, True)
+
+    # Create a future to wait for the result
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    hermes_executor._pending_sync_tasks[task_id] = future
+
+    try:
+        result = await asyncio.wait_for(future, timeout=req.timeout + 60)
+        return {
+            "task_id": task_id,
+            "exit_code": result.get("exit_code", -1),
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "error": result.get("error", ""),
+        }
+    except asyncio.TimeoutError:
+        hermes_executor._pending_sync_tasks.pop(task_id, None)
+        registry.set_fast_poll(pc_name, False)
+        return {
+            "task_id": task_id,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "",
+            "error": f"Task timed out after {req.timeout}s",
+        }
 
 
 @app.delete("/api/clients/{pc_name}")

@@ -24,6 +24,7 @@ class ClientInfo:
     last_seen: float = 0.0
     last_metrics: Optional[dict] = None
     online: bool = True
+    fast_poll: bool = False     # True when Hermes session is active
     tasks: deque = field(default_factory=deque)  # Queue of {task_id, command} dicts
 
     def to_dict(self) -> dict:
@@ -112,6 +113,20 @@ class ClientRegistry:
         if tasks:
             logger.info(f"Delivering {len(tasks)} task(s) to {pc_name}")
         return tasks
+
+    def set_fast_poll(self, pc_name: str, enabled: bool):
+        """Enable/disable fast-poll mode for a client (2s instead of 30s)."""
+        client = self._clients.get(pc_name)
+        if client:
+            client.fast_poll = enabled
+            logger.debug(f"Fast-poll for {pc_name}: {enabled}")
+
+    def get_poll_interval(self, pc_name: str) -> int:
+        """Get the current poll interval for a client (2s fast, 30s normal)."""
+        client = self._clients.get(pc_name)
+        if client and client.fast_poll:
+            return 2
+        return self.poll_interval
 
     def update_metrics(self, pc_name: str, metrics: dict):
         if c := self._clients.get(pc_name):
