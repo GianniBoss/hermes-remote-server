@@ -29,6 +29,25 @@ hermes_executor.registry = registry
 # In-memory task result store (for dashboard polling)
 _task_results: dict[str, dict] = {}
 
+# Chat history per client (persisted to disk)
+import json as _json
+from pathlib import Path as _Path
+_CHAT_HISTORY_DIR = _Path(os.path.dirname(__file__)) / "chat_history"
+_CHAT_HISTORY_DIR.mkdir(exist_ok=True)
+
+def _get_chat_history(pc_name: str) -> list[dict]:
+    path = _CHAT_HISTORY_DIR / f"{pc_name}.json"
+    if path.exists():
+        return _json.loads(path.read_text())
+    return []
+
+def _save_chat_history(pc_name: str, messages: list[dict]):
+    path = _CHAT_HISTORY_DIR / f"{pc_name}.json"
+    # Keep last 200 messages max
+    if len(messages) > 200:
+        messages = messages[-200:]
+    path.write_text(_json.dumps(messages))
+
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("alma-server")
@@ -270,29 +289,50 @@ class HermesRequest(BaseModel):
 
 @app.post("/api/clients/{pc_name}/hermes")
 async def start_hermes_session(pc_name: str, req: HermesRequest):
-    """Start an isolated Hermes session for a specific client.
-
-    Spawns Hermes CLI with custom tools that route commands ONLY to this client.
-    Hermes session runs asynchronously — poll status for results.
-    """
+    """Multi-turn Hermes chat for a client. Sessions persist across messages."""
     client = registry.get(pc_name)
-    if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
-    if not client.online:
-        raise HTTPException(status_code=400, detail=f"Client '{pc_name}' is offline")
+    if not client or not client.online:
+        raise HTTPException(status_code=400, detail=f"Client '{pc_name}' not available")
 
-    session = hermes_executor.create_session(pc_name)
-    logger.info(f"Hermes session {session.session_id} started for {pc_name}: {req.prompt[:100]}")
+    try:
+        from hermes_chat import session_manager
+        session = await session_manager.get_or_create(pc_name)
+        response = await session.send(req.prompt)
 
-    # TODO: spawn hermes CLI process with alma_exec tool
-    # For now, return session info — Hermes CLI integration is Phase 2
+        # Save to history
+        history = _get_chat_history(pc_name)
+        history.append({"role": "user", "text": req.prompt, "ts": datetime.now().isoformat()})
+        history.append({"role": "assistant", "text": response, "ts": datetime.now().isoformat()})
+        _save_chat_history(pc_name, history)
 
-    return {
-        "session_id": session.session_id,
-        "pc_name": pc_name,
-        "status": "created",
-        "prompt": req.prompt,
-    }
+        return {
+            "session_id": session.session_id,
+            "pc_name": pc_name,
+            "status": "ok",
+            "response": response,
+        }
+    except Exception as e:
+        logger.error(f"Hermes chat error: {e}")
+        import subprocess
+        result = subprocess.run(
+            ["hermes", "chat", "-q",
+             f"Responde en español. Usuario: {req.prompt}",
+             "-Q"],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip()
+        return {
+            "session_id": "fallback",
+            "pc_name": pc_name,
+            "status": "ok",
+            "response": output or "(sin respuesta)",
+        }
+
+
+@app.get("/api/clients/{pc_name}/history")
+async def get_chat_history(pc_name: str):
+    """Get chat history for a client."""
+    return {"messages": _get_chat_history(pc_name)}
 
 
 @app.get("/api/hermes/{session_id}")
@@ -375,6 +415,11 @@ async def stale_checker():
         await asyncio.sleep(30)
         registry.check_stale_clients()
         hermes_executor.cleanup_stale_sessions(max_idle=600)
+        try:
+            from hermes_chat import session_manager
+            await session_manager.cleanup_stale(max_idle=600)
+        except Exception:
+            pass
 
 
 @app.on_event("startup")

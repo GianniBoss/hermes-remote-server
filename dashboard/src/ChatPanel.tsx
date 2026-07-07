@@ -20,84 +20,63 @@ export default function ChatPanel({ client, onClose }: Props) {
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Load chat history on open
+  useEffect(() => {
+    fetch(`/api/clients/${encodeURIComponent(client.pc_name)}/history`)
+      .then(r => r.json())
+      .then(data => {
+        const msgs = (data.messages || []).map((m: any, i: number) => ({
+          id: `hist-${i}`,
+          type: m.role === 'user' ? 'command' : 'result',
+          text: m.text,
+          timestamp: m.ts || '',
+        }));
+        setMessages(msgs);
+      })
+      .catch(() => {});
+  }, [client.pc_name]);
+
   // Scroll to bottom on new messages
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Send command
+  // Send message via Hermes
   const sendCommand = async () => {
-    const cmd = input.trim();
-    if (!cmd) return;
+    const prompt = input.trim();
+    if (!prompt) return;
 
-    const clientMsgId = Math.random().toString(36).slice(2, 10);
+    const msgId = Math.random().toString(36).slice(2, 10);
     setMessages(prev => [...prev, {
-      id: clientMsgId,
+      id: msgId,
       type: 'command',
-      text: cmd,
+      text: prompt,
       timestamp: new Date().toISOString(),
     }]);
     setInput('');
     setLoading(true);
 
     try {
-      // Send command — server returns the real task_id
-      const res = await fetch(`/api/clients/${encodeURIComponent(client.pc_name)}/exec`, {
+      const res = await fetch(`/api/clients/${encodeURIComponent(client.pc_name)}/hermes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: cmd }),
+        body: JSON.stringify({ prompt, timeout: 120 }),
       });
       const data = await res.json();
-      const taskId = data.task_id;
+      setLoading(false);
 
-      if (!taskId) throw new Error('No task_id returned');
-
-      // Poll for result
-      let attempts = 0;
-      const maxAttempts = 120; // 2 min
-      const pollInterval = setInterval(async () => {
-        attempts++;
-        try {
-          const r = await fetch(`/api/tasks/${taskId}`);
-          const result = await r.json();
-          if (result.status === 'pending') {
-            // Not done yet — keep polling
-            if (attempts >= maxAttempts) {
-              clearInterval(pollInterval);
-              setLoading(false);
-              setMessages(prev => [...prev, {
-                id: taskId + '-timeout',
-                type: 'error',
-                text: 'Command timed out (no response after 2 min)',
-                timestamp: new Date().toISOString(),
-              }]);
-            }
-          } else {
-            // Result received
-            clearInterval(pollInterval);
-            setLoading(false);
-            const output = [
-              result.stdout && `STDOUT:\n${result.stdout}`,
-              result.stderr && `STDERR:\n${result.stderr}`,
-              result.error && `ERROR: ${result.error}`,
-            ].filter(Boolean).join('\n\n') || '(no output)';
-            setMessages(prev => [...prev, {
-              id: taskId + '-result',
-              type: result.exit_code === 0 ? 'result' : 'error',
-              text: output,
-              timestamp: result.timestamp || new Date().toISOString(),
-            }]);
-          }
-        } catch {
-          // Network error — keep polling
-        }
-      }, 1000);
+      setMessages(prev => [...prev, {
+        id: msgId + '-response',
+        type: data.status === 'completed' ? 'result' : 'error',
+        text: data.response || data.status || 'Sin respuesta',
+        timestamp: new Date().toISOString(),
+      }]);
     } catch (e: any) {
       setLoading(false);
       setMessages(prev => [...prev, {
-        id: clientMsgId + '-fail',
+        id: msgId + '-fail',
         type: 'error',
-        text: `Failed to send: ${e.message}`,
+        text: `Error: ${e.message}`,
         timestamp: new Date().toISOString(),
       }]);
     }
