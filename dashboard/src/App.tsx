@@ -46,11 +46,11 @@ export default function App() {
 
   // Check server status + repo URL
   useEffect(() => {
-    fetch('/api/status')
+    fetch('/api/health')
       .then(r => r.json())
       .then(d => {
         setServerStatus(d.status === 'ok' ? 'online' : 'error');
-        setRepoUrl(d.client_repo_url || '');
+        setRepoUrl('');
       })
       .catch(() => setServerStatus('offline'));
   }, []);
