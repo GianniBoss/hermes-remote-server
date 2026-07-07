@@ -53,6 +53,11 @@ class ExecRequest(BaseModel):
 class RepoUrlUpdate(BaseModel):
     repo_url: str
 
+# ── Task result store ────────────────────────────────────────────────
+# In-memory store for command execution results (task_id → result)
+task_results: dict[str, dict] = {}
+MAX_TASK_RESULTS = 500  # keep last 500 results
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  WebSocket — Client Connections
@@ -103,6 +108,21 @@ async def ws_client_endpoint(ws: WebSocket, pc_name: str):
             elif msg_type == "exec_result":
                 # Client returns command execution result
                 task_id = data.get("task_id", "unknown")
+                result = {
+                    "task_id": task_id,
+                    "pc_name": pc_name,
+                    "exit_code": data.get("exit_code"),
+                    "stdout": data.get("stdout", ""),
+                    "stderr": data.get("stderr", ""),
+                    "error": data.get("error", ""),
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+                task_results[task_id] = result
+                # Keep only last N results
+                if len(task_results) > MAX_TASK_RESULTS:
+                    oldest = sorted(task_results.keys())[:len(task_results) - MAX_TASK_RESULTS]
+                    for k in oldest:
+                        del task_results[k]
                 logger.info(f"Task {task_id} from {pc_name}: exit={data.get('exit_code')}")
 
             elif msg_type == "update_status":
@@ -153,6 +173,28 @@ async def get_client(pc_name: str):
     if not client:
         raise HTTPException(404, f"Client '{pc_name}' not found")
     return client.to_dict()
+
+@app.get("/api/clients/{pc_name}/history")
+async def get_client_history(pc_name: str):
+    """Get command execution history for a client."""
+    client = registry.get(pc_name)
+    if not client:
+        raise HTTPException(404, f"Client '{pc_name}' not found")
+    # Filter results for this client, sorted by timestamp (newest first)
+    client_results = [
+        r for r in task_results.values()
+        if r.get("pc_name") == pc_name
+    ]
+    client_results.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return {"pc_name": pc_name, "results": client_results[:50]}
+
+@app.get("/api/tasks/{task_id}")
+async def get_task_result(task_id: str):
+    """Get the result of a specific task by ID."""
+    result = task_results.get(task_id)
+    if not result:
+        raise HTTPException(404, f"Task '{task_id}' not found")
+    return result
 
 @app.post("/api/clients/{pc_name}/exec")
 async def exec_on_client(pc_name: str, req: ExecRequest):
@@ -238,6 +280,18 @@ async def set_repo_url(req: RepoUrlUpdate):
     })
     logger.info(f"Repo URL changed → {req.repo_url}, broadcast to {manager.online_count} clients")
     return {"status": "ok", "repo_url": req.repo_url, "notified_clients": manager.online_count}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Static Files — Dashboard (production)
+# ═══════════════════════════════════════════════════════════════════════
+
+import os as _os
+from fastapi.staticfiles import StaticFiles
+
+_dashboard_dir = _os.path.join(_os.path.dirname(__file__), "dashboard", "dist")
+if _os.path.isdir(_dashboard_dir):
+    app.mount("/", StaticFiles(directory=_dashboard_dir, html=True), name="dashboard")
 
 
 # ═══════════════════════════════════════════════════════════════════════
