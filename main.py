@@ -26,6 +26,9 @@ from hermes_executor import hermes_executor
 # Wire up singleton
 hermes_executor.registry = registry
 
+# In-memory task result store (for dashboard polling)
+_task_results: dict[str, dict] = {}
+
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("alma-server")
@@ -126,12 +129,29 @@ async def client_task_result(req: TaskResultRequest):
         f"Task result from {req.pc_name} [{req.task_id}]: "
         f"exit={req.exit_code}, stdout_len={len(req.stdout)}"
     )
+    # Store for dashboard polling
+    _task_results[req.task_id] = {
+        "exit_code": req.exit_code,
+        "stdout": req.stdout,
+        "stderr": req.stderr,
+        "error": req.error,
+        "timestamp": datetime.now().isoformat(),
+    }
     # Route to Hermes session if one is waiting for this result
     hermes_executor.resolve_task_result(
         req.pc_name, req.task_id,
         {"exit_code": req.exit_code, "stdout": req.stdout, "stderr": req.stderr, "error": req.error}
     )
     return {"status": "ok"}
+
+
+@app.get("/api/tasks/{task_id}")
+async def get_task_result(task_id: str):
+    """Dashboard polls this to get command execution results."""
+    result = _task_results.get(task_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found or not yet completed")
+    return result
 
 
 @app.post("/api/unregister")

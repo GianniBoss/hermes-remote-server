@@ -30,37 +30,37 @@ export default function ChatPanel({ client, onClose }: Props) {
     const cmd = input.trim();
     if (!cmd) return;
 
-    const taskId = Math.random().toString(36).slice(2, 10);
-    const msg: ChatMessage = {
-      id: taskId,
+    const clientMsgId = Math.random().toString(36).slice(2, 10);
+    setMessages(prev => [...prev, {
+      id: clientMsgId,
       type: 'command',
       text: cmd,
       timestamp: new Date().toISOString(),
-      taskId,
-    };
-
-    setMessages(prev => [...prev, msg]);
+    }]);
     setInput('');
     setLoading(true);
 
     try {
-      // Send command
+      // Send command — server returns the real task_id
       const res = await fetch(`/api/clients/${encodeURIComponent(client.pc_name)}/exec`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: cmd, task_id: taskId }),
+        body: JSON.stringify({ command: cmd }),
       });
       const data = await res.json();
+      const taskId = data.task_id;
+
+      if (!taskId) throw new Error('No task_id returned');
 
       // Poll for result
       let attempts = 0;
-      const maxAttempts = 60; // 60 * 1s = 60s timeout
+      const maxAttempts = 120; // 2 min
       const pollInterval = setInterval(async () => {
         attempts++;
         try {
           const r = await fetch(`/api/tasks/${taskId}`);
           if (r.ok) {
-            const result: TaskResult = await r.json();
+            const result = await r.json();
             clearInterval(pollInterval);
             setLoading(false);
 
@@ -74,8 +74,7 @@ export default function ChatPanel({ client, onClose }: Props) {
               id: taskId + '-result',
               type: result.exit_code === 0 ? 'result' : 'error',
               text: output,
-              timestamp: result.timestamp,
-              taskId,
+              timestamp: result.timestamp || new Date().toISOString(),
             }]);
           } else if (attempts >= maxAttempts) {
             clearInterval(pollInterval);
@@ -83,9 +82,8 @@ export default function ChatPanel({ client, onClose }: Props) {
             setMessages(prev => [...prev, {
               id: taskId + '-timeout',
               type: 'error',
-              text: 'Command timed out (no response after 60s)',
+              text: 'Command timed out (no response after 2 min)',
               timestamp: new Date().toISOString(),
-              taskId,
             }]);
           }
         } catch {
@@ -95,11 +93,10 @@ export default function ChatPanel({ client, onClose }: Props) {
     } catch (e: any) {
       setLoading(false);
       setMessages(prev => [...prev, {
-        id: taskId + '-fail',
+        id: clientMsgId + '-fail',
         type: 'error',
         text: `Failed to send: ${e.message}`,
         timestamp: new Date().toISOString(),
-        taskId,
       }]);
     }
   };
