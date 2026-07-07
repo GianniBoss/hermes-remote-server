@@ -1,22 +1,30 @@
 """
 ALMA Server
-FastAPI backend: WebSocket for clients, REST API for dashboard, webhook dispatch.
+FastAPI backend: HTTP REST API for dashboard + client heartbeat protocol.
 
-The server tells each client the GitHub repo URL on connect,
-so clients always know where to check for updates.
+Protocol (HTTP, all client → server outbound):
+  POST /api/register     Client startup
+  POST /api/heartbeat    Periodic (metrics + task polling)
+  POST /api/task-result  After executing a task
+  POST /api/unregister   Client shutdown
 """
 import os
 import uuid
+import asyncio
 import logging
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ws_manager import manager
 from client_registry import registry
 from webhook import webhook_manager
+from hermes_executor import hermes_executor
+
+# Wire up singleton
+hermes_executor.registry = registry
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -27,7 +35,8 @@ CLIENT_REPO_URL = os.getenv(
     "CLIENT_REPO_URL",
     "https://github.com/GianniBoss/alma-client",
 )
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
 # ── FastAPI App ───────────────────────────────────────────────────────
 app = FastAPI(title="ALMA Server", version=SERVER_VERSION)
@@ -40,201 +49,212 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Pydantic models ───────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Models
+# ═══════════════════════════════════════════════════════════════════════
+
+class RegisterRequest(BaseModel):
+    pc_name: str
+    hostname: str = ""
+    version: str = "0.0.0"
+    metrics: dict = {}
+
+class HeartbeatRequest(BaseModel):
+    pc_name: str
+    metrics: dict = {}
+
+class TaskResultRequest(BaseModel):
+    pc_name: str
+    task_id: str
+    exit_code: int = -1
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+
+class UnregisterRequest(BaseModel):
+    pc_name: str
+
+class ExecRequest(BaseModel):
+    command: str
+
 class WebhookConfigModel(BaseModel):
     url: str
     interval_seconds: int = 30
     enabled: bool = True
 
-class ExecRequest(BaseModel):
-    command: str
-    task_id: str | None = None
-
-class RepoUrlUpdate(BaseModel):
-    repo_url: str
-
-# ── Task result store ────────────────────────────────────────────────
-# In-memory store for command execution results (task_id → result)
-task_results: dict[str, dict] = {}
-MAX_TASK_RESULTS = 500  # keep last 500 results
-
 
 # ═══════════════════════════════════════════════════════════════════════
-#  WebSocket — Client Connections
+#  Client Protocol Endpoints (HTTP — outbound from client)
 # ═══════════════════════════════════════════════════════════════════════
 
-@app.websocket("/ws/{pc_name}")
-async def ws_client_endpoint(ws: WebSocket, pc_name: str):
-    """
-    WebSocket endpoint for agent clients.
-    Path param `pc_name` is the friendly name configured on the client.
-    """
-    await manager.connect(pc_name, ws)
-    client_ip = ws.client.host if ws.client else "unknown"
-
-    # Register in memory
-    registry.register(pc_name, client_ip=client_ip)
-
-    # First message to client: server handshake with repo URL
-    await manager.send(pc_name, {
-        "type": "handshake",
+@app.post("/api/register")
+async def client_register(req: RegisterRequest, request: Request):
+    """Client calls this on startup to announce itself."""
+    client_ip = request.client.host if request.client else "unknown"
+    registry.register(
+        pc_name=req.pc_name,
+        client_ip=client_ip,
+        hostname=req.hostname,
+        version=req.version,
+        initial_metrics=req.metrics,
+    )
+    return {
+        "status": "ok",
         "server_version": SERVER_VERSION,
+        "poll_interval": POLL_INTERVAL,
         "repo_url": CLIENT_REPO_URL,
-        "message": "Connected to ALMA Server",
-    })
+    }
 
-    try:
-        while True:
-            data = await ws.receive_json()
-            msg_type = data.get("type", "")
 
-            if msg_type == "hello":
-                # Client introduction on connect
-                registry.register(
-                    pc_name,
-                    hostname=data.get("hostname", ""),
-                    version=data.get("version", ""),
-                    client_ip=client_ip,
-                )
-                logger.info(f"Client hello: {pc_name} v{data.get('version')} on {data.get('hostname')}")
+@app.post("/api/heartbeat")
+async def client_heartbeat(req: HeartbeatRequest):
+    """Client calls this periodically. Server responds with any pending tasks."""
+    tasks = registry.heartbeat(req.pc_name, req.metrics)
+    return {
+        "status": "ok",
+        "tasks": tasks,  # [] or [{"task_id":"...", "command":"..."}, ...]
+    }
 
-            elif msg_type == "metrics":
-                # Client sends system metrics
-                registry.update_metrics(pc_name, data.get("data", {}))
 
-            elif msg_type == "pong":
-                pass  # keepalive response
+@app.post("/api/task-result")
+async def client_task_result(req: TaskResultRequest):
+    """Client calls this after executing a task."""
+    logger.info(
+        f"Task result from {req.pc_name} [{req.task_id}]: "
+        f"exit={req.exit_code}, stdout_len={len(req.stdout)}"
+    )
+    # Route to Hermes session if one is waiting for this result
+    hermes_executor.resolve_task_result(
+        req.pc_name, req.task_id,
+        {"exit_code": req.exit_code, "stdout": req.stdout, "stderr": req.stderr, "error": req.error}
+    )
+    return {"status": "ok"}
 
-            elif msg_type == "exec_result":
-                # Client returns command execution result
-                task_id = data.get("task_id", "unknown")
-                result = {
-                    "task_id": task_id,
-                    "pc_name": pc_name,
-                    "exit_code": data.get("exit_code"),
-                    "stdout": data.get("stdout", ""),
-                    "stderr": data.get("stderr", ""),
-                    "error": data.get("error", ""),
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-                task_results[task_id] = result
-                # Keep only last N results
-                if len(task_results) > MAX_TASK_RESULTS:
-                    oldest = sorted(task_results.keys())[:len(task_results) - MAX_TASK_RESULTS]
-                    for k in oldest:
-                        del task_results[k]
-                logger.info(f"Task {task_id} from {pc_name}: exit={data.get('exit_code')}")
 
-            elif msg_type == "update_status":
-                # Client reports update progress
-                logger.info(f"Update on {pc_name}: {data.get('status')}")
-
-            else:
-                logger.debug(f"Unknown message type from {pc_name}: {msg_type}")
-
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: {pc_name}")
-    except Exception as e:
-        logger.error(f"WebSocket error for {pc_name}: {e}")
-    finally:
-        manager.disconnect(pc_name)
-        registry.unregister(pc_name)
+@app.post("/api/unregister")
+async def client_unregister(req: UnregisterRequest):
+    """Client calls this on graceful shutdown."""
+    registry.unregister(req.pc_name)
+    return {"status": "ok"}
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  REST API — Dashboard
 # ═══════════════════════════════════════════════════════════════════════
 
-@app.get("/api/status")
-async def server_status():
-    """Health check + basic stats."""
-    return {
-        "status": "ok",
-        "version": SERVER_VERSION,
-        "uptime": "n/a",
-        "clients_total": registry.total_count,
-        "clients_online": registry.online_count,
-        "client_repo_url": CLIENT_REPO_URL,
-    }
-
 @app.get("/api/clients")
 async def list_clients():
-    """Get all registered clients with latest metrics."""
+    clients = registry.get_all()
     return {
-        "clients": [c.to_dict() for c in registry.get_all()],
+        "clients": [c.to_dict() for c in clients],
         "total": registry.total_count,
         "online": registry.online_count,
     }
 
+
 @app.get("/api/clients/{pc_name}")
 async def get_client(pc_name: str):
-    """Get a single client's details."""
     client = registry.get(pc_name)
     if not client:
-        raise HTTPException(404, f"Client '{pc_name}' not found")
+        raise HTTPException(status_code=404, detail="Client not found")
     return client.to_dict()
 
-@app.get("/api/clients/{pc_name}/history")
-async def get_client_history(pc_name: str):
-    """Get command execution history for a client."""
-    client = registry.get(pc_name)
-    if not client:
-        raise HTTPException(404, f"Client '{pc_name}' not found")
-    # Filter results for this client, sorted by timestamp (newest first)
-    client_results = [
-        r for r in task_results.values()
-        if r.get("pc_name") == pc_name
-    ]
-    client_results.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
-    return {"pc_name": pc_name, "results": client_results[:50]}
-
-@app.get("/api/tasks/{task_id}")
-async def get_task_result(task_id: str):
-    """Get the result of a specific task by ID."""
-    result = task_results.get(task_id)
-    if not result:
-        raise HTTPException(404, f"Task '{task_id}' not found")
-    return result
 
 @app.post("/api/clients/{pc_name}/exec")
-async def exec_on_client(pc_name: str, req: ExecRequest):
-    """Send a command to be executed on a remote client."""
-    if not manager.is_online(pc_name):
-        raise HTTPException(404, f"Client '{pc_name}' is not online")
+async def exec_command(pc_name: str, req: ExecRequest):
+    """Queue a command for a client. Delivered on next heartbeat."""
+    client = registry.get(pc_name)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if not client.online:
+        raise HTTPException(status_code=400, detail=f"Client '{pc_name}' is offline")
 
-    task_id = req.task_id or str(uuid.uuid4())[:8]
-
-    sent = await manager.send(pc_name, {
-        "type": "exec",
-        "command": req.command,
-        "task_id": task_id,
-    })
-
-    if not sent:
-        raise HTTPException(500, "Failed to send command to client")
-
+    task_id = str(uuid.uuid4())[:8]
+    registry.enqueue_task(pc_name, task_id, req.command)
     return {
         "task_id": task_id,
         "pc_name": pc_name,
-        "command": req.command,
-        "status": "sent",
-        "timestamp": datetime.utcnow().isoformat(),
+        "status": "queued",
+        "message": f"Task queued for {pc_name}. Will execute on next heartbeat.",
     }
 
-@app.post("/api/clients/{pc_name}/update")
-async def trigger_update(pc_name: str):
-    """Tell a client to check for updates now."""
-    if not manager.is_online(pc_name):
-        raise HTTPException(404, f"Client '{pc_name}' is not online")
 
-    await manager.send(pc_name, {"type": "update", "force": True})
-    return {"status": "update_triggered", "pc_name": pc_name}
+@app.delete("/api/clients/{pc_name}")
+async def disconnect_client(pc_name: str):
+    registry.unregister(pc_name)
+    return {"status": "ok", "message": f"Client '{pc_name}' marked offline"}
 
-@app.post("/api/broadcast")
-async def broadcast_message(message: dict):
-    """Send a message to ALL connected clients."""
-    await manager.broadcast(message)
-    return {"status": "broadcast", "targets": manager.online_count}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  REST API — Hermes Sessions (isolated per client)
+# ═══════════════════════════════════════════════════════════════════════
+
+class HermesRequest(BaseModel):
+    prompt: str
+    timeout: int = 300
+
+
+@app.post("/api/clients/{pc_name}/hermes")
+async def start_hermes_session(pc_name: str, req: HermesRequest):
+    """Start an isolated Hermes session for a specific client.
+
+    Spawns Hermes CLI with custom tools that route commands ONLY to this client.
+    Hermes session runs asynchronously — poll status for results.
+    """
+    client = registry.get(pc_name)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if not client.online:
+        raise HTTPException(status_code=400, detail=f"Client '{pc_name}' is offline")
+
+    session = hermes_executor.create_session(pc_name)
+    logger.info(f"Hermes session {session.session_id} started for {pc_name}: {req.prompt[:100]}")
+
+    # TODO: spawn hermes CLI process with alma_exec tool
+    # For now, return session info — Hermes CLI integration is Phase 2
+
+    return {
+        "session_id": session.session_id,
+        "pc_name": pc_name,
+        "status": "created",
+        "prompt": req.prompt,
+    }
+
+
+@app.get("/api/hermes/{session_id}")
+async def get_hermes_session(session_id: str):
+    """Check status of a Hermes session."""
+    session = hermes_executor.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "session_id": session.session_id,
+        "pc_name": session.pc_name,
+        "status": session.status,
+        "final_response": session.final_response,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  REST API — Repo URL Management
+# ═══════════════════════════════════════════════════════════════════════
+
+class RepoURLRequest(BaseModel):
+    repo_url: str
+
+
+@app.get("/api/repo-url")
+async def get_repo_url():
+    return {"repo_url": CLIENT_REPO_URL}
+
+
+@app.post("/api/repo-url")
+async def set_repo_url(req: RepoURLRequest):
+    global CLIENT_REPO_URL
+    CLIENT_REPO_URL = req.repo_url
+    logger.info(f"Repo URL changed → {req.repo_url}")
+    return {"status": "ok", "repo_url": req.repo_url}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -245,52 +265,57 @@ async def broadcast_message(message: dict):
 async def get_webhook_config():
     return webhook_manager.get_config()
 
+
 @app.post("/api/webhook/config")
 async def set_webhook_config(config: WebhookConfigModel):
-    await webhook_manager.set_config(config.url, config.interval_seconds, config.enabled)
-    return {"status": "ok", "config": webhook_manager.get_config()}
+    webhook_manager.set_config(config.url, config.interval_seconds, config.enabled)
+    return {"status": "ok"}
+
 
 @app.post("/api/webhook/trigger")
 async def trigger_webhook():
-    result = await webhook_manager.send_now()
-    return result
+    await webhook_manager.send_now()
+    return {"status": "sent"}
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  REST API — Repo URL Management
+#  Health
 # ═══════════════════════════════════════════════════════════════════════
 
-@app.get("/api/repo-url")
-async def get_repo_url():
-    """Get the client repo URL that clients use for auto-update."""
-    return {"repo_url": CLIENT_REPO_URL}
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "version": SERVER_VERSION,
+        "clients_online": registry.online_count,
+        "clients_total": registry.total_count,
+    }
 
-@app.post("/api/repo-url")
-async def set_repo_url(req: RepoUrlUpdate):
-    """
-    Change the repo URL and notify all connected clients.
-    Clients will use the new URL for future auto-update checks.
-    """
-    global CLIENT_REPO_URL
-    CLIENT_REPO_URL = req.repo_url
-    # Notify all connected clients of the new repo URL
-    await manager.broadcast({
-        "type": "repo_url_changed",
-        "repo_url": req.repo_url,
-    })
-    logger.info(f"Repo URL changed → {req.repo_url}, broadcast to {manager.online_count} clients")
-    return {"status": "ok", "repo_url": req.repo_url, "notified_clients": manager.online_count}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Background: stale client checker
+# ═══════════════════════════════════════════════════════════════════════
+
+async def stale_checker():
+    """Periodically check for clients and Hermes sessions that have gone stale."""
+    while True:
+        await asyncio.sleep(30)
+        registry.check_stale_clients()
+        hermes_executor.cleanup_stale_sessions(max_idle=600)
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(stale_checker())
+    logger.info(f"ALMA Server v{SERVER_VERSION} started")
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Static Files — Dashboard (production)
 # ═══════════════════════════════════════════════════════════════════════
 
-import os as _os
-from fastapi.staticfiles import StaticFiles
-
-_dashboard_dir = _os.path.join(_os.path.dirname(__file__), "dashboard", "dist")
-if _os.path.isdir(_dashboard_dir):
+_dashboard_dir = os.path.join(os.path.dirname(__file__), "dashboard", "dist")
+if os.path.isdir(_dashboard_dir):
     app.mount("/", StaticFiles(directory=_dashboard_dir, html=True), name="dashboard")
 
 
@@ -300,4 +325,4 @@ if _os.path.isdir(_dashboard_dir):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8765)
