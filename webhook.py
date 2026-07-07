@@ -9,7 +9,7 @@ import httpx
 import time
 import logging
 
-logger = logging.getLogger("hermes-server")
+logger = logging.getLogger("alma-server")
 
 
 @dataclass
@@ -86,7 +86,7 @@ class WebhookManager:
                 resp = await client.post(
                     self.config.url,
                     json=payload,
-                    headers={"Content-Type": "application/json", "User-Agent": "HermesRemoteServer/1.0"},
+                    headers={"Content-Type": "application/json", "User-Agent": "ALMAServer/1.0"},
                 )
                 self.last_sent_at = time.time()
                 self.last_status_code = resp.status_code

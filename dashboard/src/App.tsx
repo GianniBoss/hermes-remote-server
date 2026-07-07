@@ -79,7 +79,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <span className="text-2xl">🖥️</span>
             <div>
-              <h1 className="text-lg font-semibold">Hermes Remote</h1>
+              <h1 className="text-lg font-semibold">ALMA</h1>
               <p className="text-xs text-gray-500">Agent Management Dashboard</p>
             </div>
           </div>
@@ -140,7 +140,7 @@ export default function App() {
             <span className="text-6xl mb-4">📡</span>
             <p className="text-lg">No clients connected</p>
             <p className="text-sm mt-1">
-              Run <code className="bg-gray-800 px-2 py-0.5 rounded text-xs">hermes-agent-client.exe -server YOUR_IP:8765 -name "PC-Name"</code> on a remote PC
+              Run <code className="bg-gray-800 px-2 py-0.5 rounded text-xs">alma-client.exe -server YOUR_IP:8765 -name "PC-Name"</code> on a remote PC
             </p>
           </div>
         ) : (

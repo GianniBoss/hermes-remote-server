@@ -1,5 +1,5 @@
 """
-Hermes Remote Agents — Server
+ALMA Server
 FastAPI backend: WebSocket for clients, REST API for dashboard, webhook dispatch.
 
 The server tells each client the GitHub repo URL on connect,
@@ -20,17 +20,17 @@ from webhook import webhook_manager
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("hermes-server")
+logger = logging.getLogger("alma-server")
 
 # ── Config from env ───────────────────────────────────────────────────
 CLIENT_REPO_URL = os.getenv(
     "CLIENT_REPO_URL",
-    "https://github.com/GianniBoss/hermes-remote-client",
+    "https://github.com/GianniBoss/alma-client",
 )
 SERVER_VERSION = "1.0.0"
 
 # ── FastAPI App ───────────────────────────────────────────────────────
-app = FastAPI(title="Hermes Remote Server", version=SERVER_VERSION)
+app = FastAPI(title="ALMA Server", version=SERVER_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,7 +80,7 @@ async def ws_client_endpoint(ws: WebSocket, pc_name: str):
         "type": "handshake",
         "server_version": SERVER_VERSION,
         "repo_url": CLIENT_REPO_URL,
-        "message": "Connected to Hermes Remote Server",
+        "message": "Connected to ALMA Server",
     })
 
     try:

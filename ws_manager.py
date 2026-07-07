@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 
-logger = logging.getLogger("hermes-server")
+logger = logging.getLogger("alma-server")
 
 
 class ConnectionManager:

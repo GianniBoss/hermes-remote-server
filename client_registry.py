@@ -7,7 +7,7 @@ from typing import Dict, Optional
 import time
 import logging
 
-logger = logging.getLogger("hermes-server")
+logger = logging.getLogger("alma-server")
 
 
 @dataclass
